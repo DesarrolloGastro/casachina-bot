@@ -1,7 +1,10 @@
+import os
 import re
 import sys
+import smtplib
 import pandas as pd
 from datetime import datetime
+from email.message import EmailMessage
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
@@ -174,15 +177,67 @@ def scrape_casachina():
     return pd.DataFrame(resultados)
 
 
+def enviar_mail(archivo_excel, fecha):
+    """Envia el archivo de precios por mail usando las credenciales de las
+    variables de entorno: MAIL_REMITENTE, MAIL_PASSWORD, MAIL_DESTINATARIO.
+    Compatible con Gmail (requiere contrasena de aplicacion)."""
+    remitente = os.environ.get("MAIL_REMITENTE")
+    password = os.environ.get("MAIL_PASSWORD")
+    destinatario = os.environ.get("MAIL_DESTINATARIO")
+
+    if not remitente or not password or not destinatario:
+        print("\n[MAIL] Faltan credenciales (MAIL_REMITENTE / MAIL_PASSWORD / MAIL_DESTINATARIO).")
+        print("[MAIL] El archivo se genero pero NO se envio por correo.")
+        return False
+
+    # Soporta multiples destinatarios separados por coma
+    destinatarios = [d.strip() for d in destinatario.split(",") if d.strip()]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Lista de precios Casa China - {fecha}"
+    msg["From"] = remitente
+    msg["To"] = ", ".join(destinatarios)
+    msg.set_content(
+        f"Hola,\n\nAdjunto la lista de precios de Casa China actualizada al {fecha}.\n\n"
+        f"Este mail fue generado automaticamente.\n"
+    )
+
+    # Adjuntar el Excel
+    with open(archivo_excel, "rb") as f:
+        datos = f.read()
+    msg.add_attachment(
+        datos,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=archivo_excel,
+    )
+
+    # Envio via Gmail SMTP (SSL en puerto 465)
+    try:
+        print(f"\n[MAIL] Enviando a: {', '.join(destinatarios)}")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(remitente, password)
+            smtp.send_message(msg)
+        print("[MAIL] Enviado correctamente.")
+        return True
+    except Exception as e:
+        print(f"[MAIL] Error al enviar: {e}")
+        return False
+
+
 if __name__ == "__main__":
     df_resultados = scrape_casachina()
     fecha = datetime.now().strftime("%Y-%m-%d")
+    archivo = "precios_casachina.xlsx"
 
     # A1: proveedor | A2: fecha | A3: vacia | A4: encabezados | A5+: datos
-    with pd.ExcelWriter("precios_casachina.xlsx", engine="openpyxl") as writer:
+    with pd.ExcelWriter(archivo, engine="openpyxl") as writer:
         df_resultados.to_excel(writer, index=False, startrow=3)
         ws = writer.sheets["Sheet1"]
         ws["A1"] = "Proveedor: Casa China"
         ws["A2"] = f"Fecha: {fecha}"
 
-    print(f"\nArchivo generado: precios_casachina.xlsx ({len(df_resultados)} filas)")
+    print(f"\nArchivo generado: {archivo} ({len(df_resultados)} filas)")
+
+    # Enviar por mail
+    enviar_mail(archivo, fecha)
