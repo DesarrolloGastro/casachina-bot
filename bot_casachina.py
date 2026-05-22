@@ -1,44 +1,45 @@
-import os
-import smtplib
+import re
+import sys
 import pandas as pd
-from email.message import EmailMessage
 from datetime import datetime
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
+# Evita UnicodeEncodeError al imprimir nombres con caracteres especiales en consola Windows
+sys.stdout.reconfigure(encoding="utf-8")
+
+# Solo el nombre del producto (sin cantidad ni gramaje): el bot trae todas las
+# presentaciones que ese producto tenga en la web, cada una con su unidad real.
 productos = [
-    ("Aceite De Sesamo Samyang", "750ml"),
-    ("Aji Merken Molido", "100gr"),
-    ("Aji Panka", "100gr"),
-    ("Alga Kombu", "x paq"),
-    ("Arrolladitos Primavera Carne Food House", "10uni"),
-    ("Arrolladitos Primavera Verdura Food House", "10uni"),
-    ("Arroz Koshihikari", "5kg"),
-    ("Arroz Koshihikari", "30kg"),
-    ("Arroz Presidente", "10kg"),
-    ("Arroz Presidente", "30kg"),
-    ("Azucar Mascabo", "1kg"),
-    ("Fideos De Arroz 5mm", "400gr"),
-    ("Fideos De Arroz Trad. Soyarroz", "300grs"),
-    ("Harina De Soja Tostada Yin Yang", "500gr"),
-    ("Kanikama Familiar", "1kg"),
-    ("Maiz Cancha Roja", "500gr"),
-    ("Maiz Pisado Blanco", "1kg"),
-    ("Masa Gyoza", "50uni"),
-    ("Masa Wantan", "50uni"),
-    ("Masa Para Arrolladito", "200Gr"),
-    ("Mostaza Estragon", "200gr"),
-    ("Negui", "x paq"),
-    ("Papel De Arroz 22cm", "500grs"),
-    ("Pasta Sesamo Tahina Gourmet", "908gr"),
-    ("Pimienta Sichuan", "20gr"),
-    ("Salsa De Soja Clara", "1.9lt"),
-    ("Salsa Inglesa Darama", "5lt"),
-    ("Salsa Tabasco Sriracha", "256ml"),
-    ("Shiso", "x paq"),
-    ("Tofu Defu", "400gr"),
-    ("Tofu Defu", "800gr"),
-    ("Tofu Soyarroz Tradicional", "450gr"),
+    "Aceite De Sesamo Samyang",
+    "Aji Merken Molido",
+    "Aji Panka",
+    "Alga Kombu",
+    "Arrolladitos Primavera Carne Food House",
+    "Arrolladitos Primavera Verdura Food House",
+    "Arroz Koshihikari",
+    "Arroz Presidente",
+    "Azucar Mascabo",
+    "Fideos De Arroz 5mm",
+    "Fideos De Arroz Trad. Soyarroz",
+    "Harina De Soja Tostada Yin Yang",
+    "Kanikama Familiar",
+    "Maiz Cancha Roja",
+    "Maiz Pisado Blanco",
+    "Masa Gyoza",
+    "Masa Wantan",
+    "Masa Para Arrolladito",
+    "Mostaza Estragon",
+    "Negui",
+    "Papel De Arroz",
+    "Pasta Sesamo Tahina",
+    "Pimienta Sichuan",
+    "Salsa De Soja Clara",
+    "Salsa Inglesa Darama",
+    "Salsa Tabasco Sriracha",
+    "Shiso",
+    "Tofu Defu",
+    "Tofu Soyarroz Tradicional",
 ]
 
 
@@ -53,57 +54,71 @@ def normalizar(texto):
 
 
 def nombre_coincide(nombre_web, nombre_producto):
+    """El nombre web debe contener TODAS las palabras clave del producto buscado.
+    Asi se traen solo las presentaciones de ese producto y no otros parecidos."""
     web = normalizar(nombre_web)
+    # Palabras clave del nombre buscado (ignorar palabras cortas como "de", "con")
     palabras = [p for p in normalizar(nombre_producto).split() if len(p) > 2]
-    coincidencias = sum(1 for p in palabras if p in web)
-    return coincidencias >= max(1, len(palabras) * 0.6)
+    if not palabras:
+        return False
+    return all(p in web for p in palabras)
 
 
-def unidad_coincide(nombre_web, unidad):
-    nombre = normalizar(nombre_web)
-    unidad_norm = normalizar(unidad)
+def limpiar_nombre(nombre_web):
+    """Deja el nombre solo en espanol + unidad de medida.
+    Descarta: caracteres chinos, parentesis y su contenido, y la barra '/'."""
+    txt = nombre_web
+    # Quitar todo lo que este entre parentesis (marca, etc.)
+    txt = re.sub(r"\([^)]*\)", " ", txt)
+    # Quitar caracteres chinos / japoneses / coreanos y puntuacion CJK
+    txt = re.sub(r"[　-〿㐀-䶿一-鿿豈-﫿＀-￯]", " ", txt)
+    # Quitar la barra separadora
+    txt = txt.replace("/", " ")
+    # Normalizar espacios sobrantes
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
 
-    if unidad_norm == "x paq":
-        return True
 
-    unidad_limpia = unidad_norm.replace(" ", "")
-    nombre_limpio = nombre.replace(" ", "")
-
-    if unidad_limpia in nombre_limpio:
-        return True
-
-    variantes = [unidad_limpia]
-    if unidad_limpia.endswith("uni"):
-        variantes.append(unidad_limpia.replace("uni", "u"))
-    if unidad_limpia.endswith("grs"):
-        variantes.append(unidad_limpia.replace("grs", "gr"))
-    if unidad_limpia.endswith("gr") and not unidad_limpia.endswith("grs"):
-        variantes.append(unidad_limpia + "s")
-
-    return any(v in nombre_limpio for v in variantes)
+def extraer_precio(item):
+    """Toma el precio vigente (rojo), ignorando el precio tachado en oferta.
+    En WooCommerce el precio viejo va dentro de <del>; el precio vigente
+    es el unico que NO esta dentro de un <del>."""
+    loc = item.locator(
+        "xpath=.//span[contains(@class,'price')]"
+        "//span[contains(@class,'woocommerce-Price-amount')][not(ancestor::del)]"
+    )
+    try:
+        if loc.count() > 0:
+            return loc.first.inner_text(timeout=3000).strip()
+    except Exception:
+        pass
+    return "No encontrado"
 
 
 def scrape_casachina():
     resultados = []
+    vistos = set()  # evita repetir la misma presentacion en filas distintas
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=False, slow_mo=300)
         page = browser.new_page()
 
-        for nombre_producto, unidad in productos:
-            termino = f"{nombre_producto} {unidad}" if unidad != "x paq" else nombre_producto
-            print(f"\n--- Buscando: {nombre_producto} ({unidad})")
+        for nombre_producto in productos:
+            print(f"\n--- Buscando: {nombre_producto}")
 
             try:
-                url_busqueda = f"https://www.casachinaoficial.com/?s={quote_plus(termino)}&post_type=product"
+                # Buscar por URL directa con parametros WooCommerce
+                url_busqueda = f"https://www.casachinaoficial.com/?s={quote_plus(nombre_producto)}&post_type=product"
                 page.goto(url_busqueda, timeout=60000)
                 page.wait_for_timeout(3000)
 
+                # Cerrar popup si existe
                 try:
                     page.keyboard.press("Escape")
                     page.wait_for_timeout(500)
                 except:
                     pass
 
+                # Obtener productos de los resultados
                 items = page.locator("div.product")
                 count = items.count()
                 print(f"   {count} resultados en la busqueda")
@@ -111,7 +126,9 @@ def scrape_casachina():
                 if count == 0:
                     raise Exception("Sin resultados de busqueda")
 
-                candidatos = []
+                # Traer TODAS las presentaciones que coincidan con el nombre:
+                # cada tamano/variante es una fila propia con su unidad real.
+                encontrado = False
                 for i in range(count):
                     item = items.nth(i)
                     try:
@@ -122,115 +139,50 @@ def scrape_casachina():
                         except:
                             continue
 
-                    try:
-                        pr = item.locator("span.woocommerce-Price-amount.amount bdi").first.text_content(timeout=3000).strip()
-                    except:
-                        try:
-                            pr = item.locator("span.woocommerce-Price-amount.amount").first.text_content(timeout=3000).strip()
-                        except:
-                            try:
-                                pr = item.locator(".price").first.text_content(timeout=3000).strip()
-                            except:
-                                pr = "No encontrado"
+                    if not nombre_coincide(nw, nombre_producto):
+                        continue
 
-                    candidatos.append((nw, pr))
+                    encontrado = True
+                    nombre_limpio = limpiar_nombre(nw)
+                    clave = nombre_limpio.lower()
+                    if clave in vistos:
+                        continue
+                    vistos.add(clave)
 
-                encontrado = False
-                for nw, pr in candidatos:
-                    if nombre_coincide(nw, nombre_producto) and unidad_coincide(nw, unidad):
-                        print(f"   MATCH: {nw} | {pr}")
-                        resultados.append({
-                            "Producto": nombre_producto,
-                            "Unidad": unidad,
-                            "Nombre Web": nw,
-                            "Precio": pr,
-                            "Proveedor": "Casa China Oficial",
-                            "Fecha": datetime.now().strftime("%Y-%m-%d")
-                        })
-                        encontrado = True
-                        break
-
-                if not encontrado:
-                    for nw, pr in candidatos:
-                        if nombre_coincide(nw, nombre_producto):
-                            print(f"   MATCH parcial (nombre sin unidad exacta): {nw} | {pr}")
-                            resultados.append({
-                                "Producto": nombre_producto,
-                                "Unidad": unidad,
-                                "Nombre Web": f"(aprox) {nw}",
-                                "Precio": pr,
-                                "Proveedor": "Casa China Oficial",
-                                "Fecha": datetime.now().strftime("%Y-%m-%d")
-                            })
-                            encontrado = True
-                            break
+                    pr = extraer_precio(item)
+                    print(f"   MATCH: {nombre_limpio} | {pr}")
+                    resultados.append({
+                        "Productos": nombre_limpio,
+                        "Precio": pr,
+                    })
 
                 if not encontrado:
                     print(f"   SIN MATCH - ningun resultado coincide con '{nombre_producto}'")
                     resultados.append({
-                        "Producto": nombre_producto,
-                        "Unidad": unidad,
-                        "Nombre Web": "",
+                        "Productos": nombre_producto,
                         "Precio": "No encontrado",
-                        "Proveedor": "Casa China Oficial",
-                        "Fecha": datetime.now().strftime("%Y-%m-%d")
                     })
 
             except Exception as e:
                 print(f"   Error: {e}")
                 resultados.append({
-                    "Producto": nombre_producto,
-                    "Unidad": unidad,
-                    "Nombre Web": "",
+                    "Productos": nombre_producto,
                     "Precio": "No encontrado",
-                    "Proveedor": "Casa China Oficial",
-                    "Fecha": datetime.now().strftime("%Y-%m-%d")
                 })
 
         browser.close()
     return pd.DataFrame(resultados)
 
 
-def enviar_mail(nombre_archivo, cantidad_productos, encontrados):
-    remitente = os.environ["MAIL_REMITENTE"]
-    password = os.environ["MAIL_PASSWORD"]
-    destinatario = os.environ["MAIL_DESTINATARIO"]
-
-    msg = EmailMessage()
-    msg["Subject"] = f"Precios Casa China - {datetime.now().strftime('%Y-%m-%d')}"
-    msg["From"] = remitente
-    msg["To"] = destinatario
-    msg.set_content(
-        f"Adjunto el listado de precios de Casa China Oficial.\n\n"
-        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"Productos buscados: {cantidad_productos}\n"
-        f"Encontrados: {encontrados}\n"
-        f"No encontrados: {cantidad_productos - encontrados}\n"
-    )
-
-    with open(nombre_archivo, "rb") as f:
-        contenido = f.read()
-    msg.add_attachment(
-        contenido,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=nombre_archivo,
-    )
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(remitente, password)
-        smtp.send_message(msg)
-
-    print(f"Mail enviado a {destinatario}")
-
-
 if __name__ == "__main__":
     df_resultados = scrape_casachina()
+    fecha = datetime.now().strftime("%Y-%m-%d")
 
-    nombre_archivo = f"Casa China V {datetime.now().strftime('%Y-%m-%d')}.xlsx"
-    df_resultados.to_excel(nombre_archivo, index=False)
+    # A1: proveedor | A2: fecha | A3: vacia | A4: encabezados | A5+: datos
+    with pd.ExcelWriter("precios_casachina.xlsx", engine="openpyxl") as writer:
+        df_resultados.to_excel(writer, index=False, startrow=3)
+        ws = writer.sheets["Sheet1"]
+        ws["A1"] = "Proveedor: Casa China"
+        ws["A2"] = f"Fecha: {fecha}"
 
-    encontrados = (df_resultados["Precio"] != "No encontrado").sum()
-    print(f"\nArchivo generado: {nombre_archivo} ({len(df_resultados)} productos, {encontrados} encontrados)")
-
-    enviar_mail(nombre_archivo, len(df_resultados), encontrados)
+    print(f"\nArchivo generado: precios_casachina.xlsx ({len(df_resultados)} filas)")
