@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import pandas as pd
@@ -117,8 +118,13 @@ def extraer_precio(item):
 def scrape_casachina():
     resultados = []
     vistos = set()  # evita repetir la misma presentacion en filas distintas
+
+    # En GitHub Actions (u otro CI) no hay display, asi que va headless si o si.
+    # Local: ventana visible para debuggear. GitHub Actions define CI=true.
+    is_ci = os.getenv("CI") == "true"
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=300)
+        browser = p.chromium.launch(headless=is_ci, slow_mo=300)
         page = browser.new_page()
 
         for nombre_producto in productos:
